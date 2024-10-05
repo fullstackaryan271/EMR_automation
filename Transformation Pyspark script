@@ -1,0 +1,455 @@
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.window import Window
+import boto3
+
+# Initialize Spark session
+spark = SparkSession.builder.appName("EMR_Sales_Transaction_Transformation").getOrCreate()
+
+# Define the S3 Input Bucket and Output Folder paths
+input_bucket = 'rpsg-bronze-layer'
+input_folder_path = 'Curated_bronze_layer/Updated_curated_layer/'
+
+output_bucket = 'rpsg-silver-layer'
+output_folder_path = 'spencers-Silver-SalesTransaction_BWPOS/'
+
+# Read the CSV file from S3
+concatenated_df = spark.read.option("header", "true").option("inferSchema", "true").csv(f"s3://{input_bucket}/{input_folder_path}*")
+concatenated_df = concatenated_df.withColumn('LINE_ITEM_NO',col('LINE_ITEM_NO').cast('int'))
+concatenated_df = concatenated_df.withColumn('ARTICLE_CODE',col('ARTICLE_CODE').cast('bigint'))
+
+# Here starts the Data Transformation for Silver Tables
+# Step-1 : create a composite key by joining 4 Column data to identify a single transaction
+df = concatenated_df.withColumn("CompositeKey", concat_ws("_", "STORE_CODE", "TILL_NO", "BILL_DATE", "BILL_NO", "LINE_ITEM_NO"))
+
+# Filter dataframe for Transaction Details by ignoring where No Price Condition is defined
+promo = ['PN10', 'VKA0', 'KA04', 'KA02', 'Z006', 'Z007', 'ZPRO', 'ZFRE', 'ZCAT', 'ZEMP', 'ZBIL']
+df = df.filter(col('PRICE_CONDITION').isin(promo))
+df = df.filter(col("BILL_DATE") > 20240229)
+
+df = df.select("CompositeKey", "PRICE_CONDITION", "PROMO_ID", "PRICE_DISCOUNT_VALUE")
+df = df.groupby("CompositeKey", "PRICE_CONDITION").agg(F.concat_ws("|", F.collect_list("PROMO_ID")).alias("Codes"), F.sum("PRICE_DISCOUNT_VALUE").alias("Total_Value"))
+
+# Create a dataframe to pivot table based on Price Condition, for different PROMO_ID and PRICE / DISCOUNT
+pivot_df = df.groupBy('CompositeKey').pivot('PRICE_CONDITION').agg(
+    first(df["Codes"]).alias("PROMO_ID"),
+    first(when(col("PRICE_CONDITION") != "PN10", df["Total_Value"])).alias("DISCOUNT"),
+    first(when((col("PRICE_CONDITION") == "PN10") | (col("PRICE_CONDITION") == "VKA0") | (col("PRICE_CONDITION") == "Z006"), df["Total_Value"])).alias("AMOUNT")
+)
+
+# Select PRICE_CONDITION and PRICE_DISCOUNT_VALUE
+dfPN10 = concatenated_df.filter(col("PRICE_CONDITION") == 'PN10')
+dfPN10 = dfPN10.filter(col("BILL_DATE") > 20240229)
+
+dfPN10 = (
+    dfPN10.withColumn(
+        "SALE_SIGN",
+        when(col("SALE_SIGN") == "+", "RETURN")
+        .when(col("SALE_SIGN") == "-", "SALE")
+        .when(col("SALE_SIGN").isNull(), "PAYMENT")
+    )
+)
+
+dfPN10 = dfPN10.drop("NULL1", "NULL3", "TENDER_SIGN", "TENDER_TYPE", "TENDER_AMOUNT", "CARD_TYPE", "CURR2", "CARD_NO", "GIFT_COUPON_CODE", "NULL4", "ORIGINAL_BILL_DATE", "CARD_HOLDER_NAME", "REVISED_BILL_NO", "ORIGINAL_BILL_NO", "CC_AUTHORIZATION_CODE", "TILL_NO_DUP", "BILL_TIME_DUP", "N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12")
+
+# Join the pivot_df with the selected PRICE_CONDITION column
+result_df = pivot_df.join(dfPN10, on='CompositeKey', how='left')
+
+# Define TOTAL_MRP Column (= PN10_AMOUNT)
+result_df = result_df.withColumnRenamed("PN10_AMOUNT", "TOTAL_MRP")
+result_df = result_df.withColumn("MANUAL_DISCOUNT", trim(col("MANUAL_DISCOUNT")))
+
+for col_name in result_df.columns:
+    if col_name.endswith('_DISCOUNT'):
+        result_df = result_df.withColumn(col_name, round(when(col(col_name).isNotNull(), col(col_name)).otherwise(lit(0.0)), 2))
+
+# Calculate the values for VKA0_DISCOUNT and Z006_DISCOUNT
+if "VKA0_AMOUNT" in result_df.columns:
+    result_df = result_df.withColumn(
+        "VKA0_DISCOUNT",
+        when(col("VKA0_AMOUNT").isNotNull(), col("TOTAL_MRP") - col("VKA0_AMOUNT")).otherwise(lit(0.0))
+    )
+    result_df = result_df.withColumn("VKA0_DISCOUNT", round(col("VKA0_DISCOUNT"),2))
+    
+if "Z006_AMOUNT" in result_df.columns:
+    result_df = result_df.withColumn(
+        "Z006_DISCOUNT",
+        when(col("Z006_AMOUNT").isNotNull(), col("TOTAL_MRP") - col("Z006_AMOUNT")).otherwise(lit(0.0))
+    )
+    result_df = result_df.withColumn("Z006_DISCOUNT", round(col("Z006_DISCOUNT"),2))
+
+# Drop columns with "_AMOUNT" suffix
+amount_columns = [col_name for col_name in result_df.columns if col_name.endswith("_AMOUNT")]
+result_df = result_df.drop(*amount_columns)
+
+result_df = result_df.withColumn("LINE_ITEM_QTY", round(col("LINE_ITEM_QTY"),3))
+result_df = result_df.withColumn("ARTICLE_MRP", col("TOTAL_MRP") / col("LINE_ITEM_QTY"))
+result_df = result_df.withColumn("ARTICLE_MRP", round(col("ARTICLE_MRP"), 2))
+
+# Create a discount column based on the conditions given & Replace null values with 0.0 in columns ending with "_DISCOUNT"
+discount_columns = [col_name for col_name in result_df.columns if col_name.endswith("_DISCOUNT") and col_name != "MANUAL_DISCOUNT"]
+result_df = result_df.withColumn(
+    "TOTAL_DISCOUNT",
+    round(expr(f"COALESCE({'+'.join(discount_columns)}, 0)"), 2)
+)
+
+result_df = result_df.withColumn(
+    "PROMO_INDICATOR",
+    when(col("TOTAL_DISCOUNT") >= 0.10, "P").otherwise("N")
+)
+
+# Create a new attribute "GROSS_SALES_CALC"
+result_df = result_df.withColumn(
+    "GROSS_SALES_CALC",
+    when(col("SALE_SIGN") == "RETURN", (-col("TOTAL_MRP") + col("TOTAL_DISCOUNT")))
+    .otherwise(col("TOTAL_MRP") - col("TOTAL_DISCOUNT"))
+)
+
+result_df = result_df.withColumn("GROSS_SALES_CALC", round(col("GROSS_SALES_CALC"), 2))
+result_df = result_df.withColumn(
+    "SALES_VALUE_FLAG",
+    when(col("GROSS_SALES") != col("GROSS_SALES_CALC"), 0).otherwise(1)
+)
+
+result_df = result_df.withColumn("BILL_DATE", date_format(to_date(col("BILL_DATE").cast("string"), "yyyyMMdd"), "yyyy-MM-dd"))
+result_df = result_df.withColumn('YEAR', date_format('BILL_DATE', 'yyyy'))
+result_df = result_df.withColumn('YEAR_MONTH', date_format(col('BILL_DATE'), 'yyyy-MM-dd'))
+result_df = result_df.withColumn("CALENDER_WEEK", weekofyear(result_df["BILL_DATE"]))
+
+# Convert week of year to a string and pad with leading zeros if needed
+result_df = result_df.withColumn("CALENDER_WEEK", result_df["CALENDER_WEEK"].cast("string"))
+result_df = result_df.withColumn("CALENDER_WEEK", concat(lit(result_df["YEAR"]), lit('-'), 
+    when(length(result_df["CALENDER_WEEK"]) == 1, concat(lit('0'), result_df["CALENDER_WEEK"])).otherwise(result_df["CALENDER_WEEK"])))                       
+
+result_df = result_df.withColumn("BILL_DATE", col("BILL_DATE").cast("timestamp"))
+result_df = result_df.withColumn(
+    "WEEK_START",
+    expr("date_trunc('week', BILL_DATE)")
+)
+
+result_df = result_df.withColumn("BILL_DATE", col("BILL_DATE").cast("string"))
+result_df = result_df.withColumn(
+    "WEEK_START",
+    date_format(col("WEEK_START"),"dd-MMM-yyyy") 
+)
+result_df = result_df.withColumn("BILL_DATE", date_format(col("BILL_DATE"), "dd-MMM-yyyy"))
+result_df = result_df.withColumn("YEAR_MONTH", date_format(col("YEAR_MONTH"), "01-MMM-yyyy"))
+
+result_df = result_df.withColumn(
+    "GIFT_FLAG",
+    when((col("GIFT_FLAG") == "Y") | (col("GIFT_FLAG") == "N"), col("GIFT_FLAG")).otherwise("N")
+)
+
+result_df = result_df.withColumn("PROMO_CODE", when(length(col("PROMO_CODE")) < 2, '-').otherwise(col("PROMO_CODE")))
+result_df = result_df.withColumn("PROMO_CODES", split(col("PROMO_CODE"), "\|"))
+
+# Define the maximum number of promo codes you expect (in this case, 8)
+max_promo_codes = 8
+
+# Create separate columns for each promo code dynamically
+for i in range(1, max_promo_codes + 1):
+    column_name = f"PROMO_CODE{i}"
+    result_df = result_df.withColumn(column_name, col("PROMO_CODES").getItem(i - 1))
+
+# Drop the temporary "PROMO_CODES" column
+result_df = result_df.drop("PROMO_CODES")
+
+result_df = (
+    result_df.withColumn(
+        "PRIMARY_CHANNEL",
+        when(col("TILL_NO") == 9999, "ONLINE")
+        .when(col("TILL_NO") == 9988, "TGS")
+        .otherwise("OFFLINE")
+    )
+    .withColumn(
+        "LIQUIDATION_TYPE",
+        when(col("PRIMARY_CHANNEL") == "OFFLINE", col("LIQUIDATION_FLAG")).otherwise(None)
+    )
+    .withColumn(
+        "ONLINE_SALES_LOC",
+        when((col("PRIMARY_CHANNEL") == "ONLINE") | (col("PRIMARY_CHANNEL") == "TGS"), col("LIQUIDATION_FLAG")).otherwise(None)
+    )
+)
+
+result_df = result_df.withColumn(
+    "BULK_FLAG",
+    when(((col("GROSS_SALES") >= 10000.0) & (col("LINE_ITEM_QTY") >= 50.0)), 1).otherwise(0)
+)
+
+result_df = result_df.withColumn(
+    "CASHIER_NAME_ONLY",
+    when(
+        (col("PRIMARY_CHANNEL") == "OFFLINE") | col("CASHIER_NAME_SALES_EXTENSION").contains("-"),
+        expr("substring_index(CASHIER_NAME_SALES_EXTENSION, '-', 1)")
+    ).otherwise(col("CASHIER_NAME_SALES_EXTENSION"))
+).withColumn(
+    "PD_Flag",
+    when((col("CASHIER_NAME_SALES_EXTENSION").contains("-HD")) | (col("CASHIER_NAME_SALES_EXTENSION").contains("@HD")), 1)
+    .otherwise(0)
+).withColumn(
+    "B2B_Flag",
+    when((col("PRIMARY_CHANNEL") == "OFFLINE") & col("CASHIER_NAME_SALES_EXTENSION").contains("-G1"), 1)
+    .otherwise(0)
+).withColumn(
+    "GIFT_Flag_CASHIER",
+    when((col("PRIMARY_CHANNEL") == "OFFLINE") & col("CASHIER_NAME_SALES_EXTENSION").contains("-GF"), 1)
+    .otherwise(0)
+).withColumn(
+    "Manual_Flag",
+    when((col("PRIMARY_CHANNEL") == "OFFLINE") & col("CASHIER_NAME_SALES_EXTENSION").contains("-M"), 1)
+    .otherwise(0)
+).withColumn(
+    "RW_Flag",
+    when((col("PRIMARY_CHANNEL") == "OFFLINE") & col("CASHIER_NAME_SALES_EXTENSION").contains("-RW"), 1)
+    .otherwise(0)
+)
+
+result_df = result_df.withColumn(
+    "CASHIER_NAME_ONLY",
+    when(col("PRIMARY_CHANNEL") == "ONLINE", expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '-', 1), '|', 1)")).otherwise(col("CASHIER_NAME_ONLY"))
+).withColumn(
+    "INVOICE_ID",
+    when(
+        (col("CASHIER_NAME_ONLY") == "OMSG@") & (col("SALE_SIGN") == "SALE"),
+        expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '|', 2), '|', -1)")
+    ).when(
+        (col("CASHIER_NAME_ONLY") == "OMSG@") & (col("SALE_SIGN") == "RETURN"),
+        expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '|', 6), '|', -1)")
+    ).otherwise(None)
+).withColumn(
+    "INVOICE_DATE",
+    when(
+        (col("CASHIER_NAME_ONLY") == "OMSG@") & (col("SALE_SIGN") == "SALE"),
+        expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '|', 3), '|', -1)")
+    ).when(
+        (col("CASHIER_NAME_ONLY") == "OMSG@") & (col("SALE_SIGN") == "RETURN"),
+        expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '|', 7), '|', -1)")
+    ).otherwise(None)
+).withColumn(
+    "PORTAL_BOOKING_ID",
+    when(
+        (col("CASHIER_NAME_ONLY") == "OMSG@") & (col("SALE_SIGN") == "SALE"),
+        expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '|', 4), '|', -1)")
+    ).when(
+        (col("CASHIER_NAME_ONLY") == "OMSG@") & (col("SALE_SIGN") == "RETURN"),
+        expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '|', 4), '|', -1)")
+    ).when(
+        col("CASHIER_NAME_ONLY") == "Admin",
+        expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '-', 2), '-', -1)")
+    ).otherwise(None)
+).withColumn(
+    "PORTAL_BOOKING_DATE",
+    when(
+        (col("CASHIER_NAME_ONLY") == "OMSG@") & (col("SALE_SIGN") == "SALE"),
+        expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '|', 5), '|', -1)")
+    ).when(
+        (col("CASHIER_NAME_ONLY") == "OMSG@") & (col("SALE_SIGN") == "RETURN"),
+        expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '|', 5), '|', -1)")
+    ).when(
+        col("CASHIER_NAME_ONLY") == "Admin",
+        expr("substr(substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '-', 3), '-', -1), 1,8)")
+    ).otherwise(None)
+).withColumn(
+    "PORTAL_BOOKING_TIME",
+    when(
+        col("CASHIER_NAME_ONLY") == "Admin",
+        expr("substr(substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '-', 3), '-', -1), 9)")
+    ).otherwise(None)
+).withColumn(
+    "DELIVERY_SLOT",
+    when(
+        col("CASHIER_NAME_ONLY") == "Admin",
+        expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '-', 4), '-', -1)")
+    ).otherwise(None)
+).withColumn(
+    "CHALLAN_ID",
+    when(
+        col("CASHIER_NAME_ONLY") == "Admin",
+        expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '-', 5), '-', -1)")
+    ).otherwise(None)
+).withColumn(
+    "PORTAL_NAME",
+    when(
+        (col("CASHIER_NAME_ONLY") == "OMSG@") & (col("SALE_SIGN") == "SALE"),
+        expr("substring_index(CASHIER_NAME_SALES_EXTENSION, '|', -1)")
+    ).when(
+        (col("CASHIER_NAME_ONLY") == "OMSG@") & (col("SALE_SIGN") == "RETURN"),
+        expr("substring_index(CASHIER_NAME_SALES_EXTENSION, '|', -1)")
+    ).otherwise(None)
+).withColumn(
+    "CN_NUMBER",
+    when(
+        (col("CASHIER_NAME_ONLY") == "OMSG@") & (col("SALE_SIGN") == "RETURN"),
+        expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '|', 2), '|', -1)")
+    ).otherwise(None)
+).withColumn(
+    "CN_DATE",
+    when(
+        (col("CASHIER_NAME_ONLY") == "OMSG@") & (col("SALE_SIGN") == "RETURN"),
+        expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '|', 3), '|', -1)")
+    ).otherwise(None)
+).withColumn(
+    "CHALLAN_DATE",
+    when(
+        col("CASHIER_NAME_ONLY") == "Admin",
+        expr("substr(substring_index(CASHIER_NAME_SALES_EXTENSION, '-', -1),1,8)")
+    ).otherwise(None)
+).withColumn(
+    "CHALLAN_TIME",
+    when(
+        col("CASHIER_NAME_ONLY") == "Admin",
+        expr("substr(substring_index(CASHIER_NAME_SALES_EXTENSION, '-', -1),9)")
+    ).otherwise(None)
+)
+
+result_df = result_df.withColumn("INVOICE_DATE", to_date(col("INVOICE_DATE").cast("string"), "yyyyMMdd"))
+result_df = result_df.withColumn("INVOICE_DATE", date_format(col("INVOICE_DATE"), "dd-MMM-yyyy"))
+
+result_df = result_df.withColumn("PORTAL_BOOKING_DATE", to_date(col("PORTAL_BOOKING_DATE").cast("string"), "yyyyMMdd"))
+result_df = result_df.withColumn("PORTAL_BOOKING_DATE", date_format(col("PORTAL_BOOKING_DATE"), "dd-MMM-yyyy"))
+
+result_df = result_df.withColumn("CHALLAN_DATE", to_date(col("CHALLAN_DATE").cast("string"), "yyyyMMdd"))
+result_df = result_df.withColumn("CHALLAN_DATE", date_format(col("CHALLAN_DATE"), "dd-MMM-yyyy"))
+
+result_df = result_df.withColumn("CN_DATE", to_date(col("CN_DATE").cast("string"), "yyyyMMdd"))
+result_df = result_df.withColumn("CN_DATE", date_format(col("CN_DATE"), "dd-MMM-yyyy"))
+
+# Splitting loyalty card phone column 
+result_df = result_df.withColumn("LOYALTY_CARD_SPLIT", split(col("LOYALTY_CARD_PHONE"), "-"))
+result_df = result_df.withColumn("LOYALTY_CARD_NO", when(col("LOYALTY_CARD_SPLIT")[0].isNotNull(), col("LOYALTY_CARD_SPLIT")[0]).otherwise(None))
+
+result_df = result_df.withColumn(
+    "PHONE_NO", 
+    when((col("LOYALTY_CARD_SPLIT")[1].isNotNull()) & (length(col("LOYALTY_CARD_SPLIT")[1]) == 12), col("LOYALTY_CARD_SPLIT")[1])
+    .when((col("LOYALTY_CARD_SPLIT")[1].isNotNull()) & (length(col("LOYALTY_CARD_SPLIT")[1]) == 10), concat(lit("91"), col("LOYALTY_CARD_SPLIT")[1]))
+    .otherwise(lit(0))
+)
+
+result_df = result_df.drop("LOYALTY_CARD_SPLIT")
+result_df = result_df.withColumnRenamed("CURR1","CURRENCY")
+
+result_df = result_df.withColumn("CHALLAN_TIME", col("CHALLAN_TIME").cast("int"))
+result_df = result_df.withColumn("PORTAL_BOOKING_TIME", col("PORTAL_BOOKING_TIME").cast("int"))
+
+# Function to transform time columns
+def transform_time_columns(df, time_column_name):
+    hh_col = f"{time_column_name}_hh"
+    mm_col = f"{time_column_name}_mm"
+    ss_col = f"{time_column_name}_ss"
+
+    return (
+        df.withColumn(hh_col, (col(time_column_name) / 10000).cast("int"))
+          .withColumn(mm_col, ((col(time_column_name) % 10000) / 100).cast("int"))
+          .withColumn(ss_col, (col(time_column_name) % 100).cast("int"))
+          .withColumn(
+              time_column_name,
+              concat_ws(":", expr(f"lpad({hh_col}, 2, '0')"), expr(f"lpad({mm_col}, 2, '0')"), expr(f"lpad({ss_col}, 2, '0')"))
+          )
+          .drop(hh_col, mm_col, ss_col)
+    )
+
+# Transforming time columns
+result_df = transform_time_columns(result_df, "PORTAL_BOOKING_TIME")
+result_df = transform_time_columns(result_df, "CHALLAN_TIME")
+result_df = transform_time_columns(result_df, "BILL_TIME")
+result_df = transform_time_columns(result_df, "BILL_START_TIME")
+result_df = transform_time_columns(result_df, "BILL_END_TIME")
+result_df = transform_time_columns(result_df, "OTP_GEN_TIME")
+result_df = transform_time_columns(result_df, "OTP_FEED_TIME")
+
+df = result_df.withColumn("NewCompositeKey", concat_ws("_", "STORE_CODE", "TILL_NO", "BILL_DATE", "BILL_NO"))
+nw_df = df.select("NewCompositeKey","LINE_ITEM_NO")
+
+# Group by alternative option
+nw_df = nw_df.groupBy("NewCompositeKey").agg(countDistinct("LINE_ITEM_NO").alias("TOT_LINE_NO"))
+nw_df = nw_df.drop("LINE_ITEM_NO")
+nw_df = nw_df.dropDuplicates(['NewCompositeKey'])
+df = df.join(nw_df, on = 'NewCompositeKey', how = 'left')
+df = df.dropDuplicates(['CompositeKey'])
+
+df = df.drop("LOYALTY_CARD_PHONE", "PROMO_CODE", "PROMO_ID", "PRICE_SIGN", "PRICE_CONDITION", "PRICE_DISCOUNT_VALUE", "LIQUIDATION_FLAG")
+
+df = df.withColumn("GIFT_CARD_GHIT", when(length(col("GIFT_CARD_GHIT")) <= 2, '-'))
+df = df.withColumn("BONUS_BUY_ID", when(length(col("BONUS_BUY_ID")) <= 2, '-'))
+df = df.withColumn("SUPERVISOR_ID", when(length(col("SUPERVISOR_ID")) <= 2, '-'))
+df = df.withColumn("SUPERVISOR_NAME", when(length(col("SUPERVISOR_NAME")) <= 2, '-'))
+
+df = df.withColumn("TOTAL_MRP", col("TOTAL_MRP").cast('double'))
+df = df.withColumn("TOTAL_MRP", round(col("TOTAL_MRP"), 2))
+df = df.withColumn("GROSS_SALES", col("GROSS_SALES").cast('double'))
+df = df.withColumn("GROSS_SALES", round(col("GROSS_SALES"), 2))
+
+df = df.withColumn(
+    "MANUAL_BILL_NO",
+    when(col("MANUAL_FLAG") == 1, expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '-M-', -1), '-', 1)")).otherwise(None)
+).withColumn(
+    "MANUAL_BILL_DATE",
+    when(col("MANUAL_FLAG") == 1, expr("substring_index(substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '-M-', -1), '-', 2), '-', -1)")).otherwise(None)
+)
+
+df = df.withColumn("MANUAL_BILL_DATE", to_date("MANUAL_BILL_DATE", "ddMMyyyy"))
+df = df.withColumn("MANUAL_BILL_DATE", date_format("MANUAL_BILL_DATE", "dd-MMM-yyyy"))
+
+df = df.withColumn(
+    "GSTIN",
+    when(col("B2B_Flag") == 1 , expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '-G1', -1),'|',1)")).otherwise(None)
+).withColumn(
+    "SELLER_STATE",
+    when(col("B2B_Flag") == 1 , expr("substring_index(substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '-G1', -1),'|',2),'|',-1)")).otherwise(None)
+).withColumn(
+    "STATE_CODE",
+    when(col("B2B_Flag") == 1 , expr("substring_index(substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '-G1', -1),'|',3),'|',-1)")).otherwise(None)
+).withColumn(
+    "CUSTOMER_NAME",
+    when(col("CASHIER_NAME_SALES_EXTENSION").contains("-N1") , expr("substring_index(substring_index(CASHIER_NAME_SALES_EXTENSION, '-N1', -1),'-',1)")).otherwise(None)
+).withColumn(
+    "CUSTOMER_ADDRESS",
+    when(col("CASHIER_NAME_SALES_EXTENSION").contains("-A1") , expr("substring_index(CASHIER_NAME_SALES_EXTENSION, '-A1', -1)")).otherwise(None)
+).withColumn(
+    "INDICATOR_FOR_SMART",
+    when((col("article_code") == 1226202) & isnull(col("LOYALTY_CARD_NO")), 'X')
+    .when((col("article_code") != 1226202) & ~isnull(col("LOYALTY_CARD_NO")), 'Y')
+    .when((col("article_code") == 1226202) & ~isnull(col("LOYALTY_CARD_NO")), 'Z')
+    .otherwise(None)
+).withColumn(
+    "BU",
+    when(col("store_code").startswith("N"), 'NBL').otherwise("SPENCER'S")
+)
+
+df = df.withColumnRenamed("NULL2", "LIQUIDATION_DOC")
+df = df.withColumn("LIQUIDATION_DOC", when(length(col("LIQUIDATION_DOC"))>2, col("LIQUIDATION_DOC")).otherwise(None))
+
+required_columns = ["ka02_promo_id", "ka04_promo_id", "vka0_promo_id", "z006_promo_id", "z007_promo_id", "zbil_promo_id", "zcat_promo_id", "zemp_promo_id", "zfre_promo_id", "zpro_promo_id"]
+df_columns = df.columns
+missing_columns = list(set(required_columns) - set(df_columns))
+for i in missing_columns:
+    df = df.withColumn(i, lit(None).cast(StringType()))
+
+required_columns = ["ka02_discount", "ka04_discount", "vka0_discount", "z006_discount", "z007_discount", "zbil_discount", "zcat_discount", "zemp_discount", "zfre_discount", "zpro_discount"]
+df_columns = df.columns
+missing_columns = list(set(required_columns) - set(df_columns))
+for i in missing_columns:
+    df = df.withColumn(i, lit(0).cast(DoubleType()))
+
+df = df.withColumn("BILL_NO", col("BILL_NO").cast("bigint"))
+df = df.withColumn("CHALLAN_ID", col("CHALLAN_ID").cast("bigint"))
+df = df.withColumn("LOYALTY_CARD_NO", col("LOYALTY_CARD_NO").cast("bigint"))
+df = df.withColumn("MANUAL_BILL_NO", col("MANUAL_BILL_NO").cast("bigint"))
+df = df.withColumn("PHONE_NO", col("PHONE_NO").cast("bigint"))
+df = df.withColumn("PORTAL_BOOKING_ID", col("PORTAL_BOOKING_ID").cast("int"))
+df = df.withColumn("TOT_LINE_NO", col("TOT_LINE_NO").cast("int"))
+
+col_name = df.columns 
+for i in col_name:
+    df = df.withColumnRenamed(i, i.upper())
+
+df = df.withColumn("DATE_STAMP", current_timestamp())
+df = df.withColumn("Part1", col("YEAR_MONTH")).withColumn("Part2", col("STORE_CODE"))
+
+# Define output path
+output_path = f"s3://{output_bucket}/{output_folder_path}"
+df.write.mode("append").option("header", "true").partitionBy("Part1", "Part2").parquet(output_path, compression='snappy')
+
+spark.stop()
