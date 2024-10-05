@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  MyS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub 'my-bucket-${AWS::AccountId}'
+
+  MyS3BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref MyS3Bucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+            Effect: 'Allow'
+            Resource: !Sub 'arn:aws:s3:::${MyS3Bucket}/*'
+            Principal: '*'
+
+  MySNSTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: 'MySNSTopic'
+
+  MyStepFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'states.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'StepFunctionPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:*'
+                  - 'sns:Publish'
+                  - 'elasticmapreduce:*'
+                Resource: '*'
+
+  MyStepFunction:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      RoleArn: !GetAtt MyStepFunctionRole.Arn
+      DefinitionString:
+        !Sub |
+          {
+            "Comment": "A description of my state machine",
+            "StartAt": "Create EMR Cluster",
+            "States": {
+              "Create EMR Cluster": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::elasticmapreduce:createCluster.sync",
+                "Parameters": {
+                  "Name": "EMR Cluster",
+                  "ReleaseLabel": "emr-6.2.0",
+                  "Instances": {
+                    "InstanceGroups": [
+                      {
+                        "Name": "Master nodes",
+                        "Market": "ON_DEMAND",
+                        "InstanceRole": "MASTER",
+                        "InstanceType": "m5.xlarge",
+                        "InstanceCount": 1
+                      },
+                      {
+                        "Name": "Core nodes",
+                        "Market": "ON_DEMAND",
+                        "InstanceRole": "CORE",
+                        "InstanceType": "m5.xlarge",
+                        "InstanceCount": 2
+                      }
+                    ]
+                  },
+                  "Steps": [
+                    {
+                      "Name": "Example Step",
+                      "ActionOnFailure": "TERMINATE_CLUSTER",
+                      "HadoopJarStep": {
+                        "Jar": "command-runner.jar",
+                        "Args": ["state-pusher-script"]
+                      }
+                    }
+                  ],
+                  "Configurations": [],
+                  "VisibleToAllUsers": true,
+                  "JobFlowRole": "EMR_EC2_DefaultRole",
+                  "ServiceRole": "EMR_DefaultRole"
+                },
+                "Next": "Wait 10 Minutes"
+              },
+              "Wait 10 Minutes": {
+                "Type": "Wait",
+                "Seconds": 600,
+                "Next": "Terminate EMR Cluster"
+              },
+              "Terminate EMR Cluster": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::elasticmapreduce:terminateCluster.sync",
+                "Parameters": {
+                  "ClusterId.$": "$.ClusterId"
+                },
+                "End": true
+              }
+            }
+          }
+
+  MyEventBridgeRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      ScheduleExpression: 'rate(1 day)'
+      State: 'ENABLED'
+      Targets:
+        - Arn: !Ref MyStepFunction
+          Id: 'MyStepFunctionTarget'
+
+  MyEventBridgeRuleRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'events.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'EventBridgeRulePolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action: 'states:StartExecution'
+                Resource: !Ref MyStepFunction
+
+  MyStepFunctionFailRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      EventPattern:
+        source:
+          - 'aws.states'
+        detail-type:
+          - 'Step Functions Execution Status Change'
+        detail:
+          status:
+            - 'FAILED'
+      Targets:
+        - Arn: !Ref MySNSTopic
+          Id: 'MySNSTopicTarget'
+
+  MyLambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'LambdaS3Policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${MyS3Bucket}/*'
+
+  MyLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: 'index.handler'
+      Role: !GetAtt MyLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          s3 = boto3.client('s3')
+
+          def handler(event, context):
+              bucket_name = os.environ['BUCKET_NAME']
+              file_path = os.environ['FILE_PATH']
+              key = os.path.basename(file_path)
+
+              with open(file_path, 'rb') as data:
+                  s3.upload_fileobj(data, bucket_name, key)
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('File uploaded successfully!')
+              }
+      Runtime: 'python3.8'
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref MyS3Bucket
+          FILE_PATH: '/tmp/myfile.txt'  # Update this with your local file path
+
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref MyLambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 's3.amazonaws.com'
+
+Outputs:
+  S3BucketName:
+    Description: 'Name of the S3 bucket'
+    Value: !Ref MyS3Bucket
+
+  StepFunctionARN:
+    Description: 'ARN of the Step Function'
+    Value: !Ref MyStepFunction
+
+  SNSTopicARN:
+    Description: 'ARN of the SNS Topic'
+    Value: !Ref MySNSTopic
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Ref MyLambdaFunction
