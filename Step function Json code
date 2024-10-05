@@ -1,0 +1,94 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "EMR CreateCluster",
+  "States": {
+    "EMR CreateCluster": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::elasticmapreduce:createCluster",
+      "Parameters": {
+        "Name": "Pos-cluster",
+        "ServiceRole": "AmazonEMR-ServiceRole-20240521T212937",
+        "JobFlowRole": "AmazonEMR-InstanceProfile-20240521T212918",
+        "ReleaseLabel": "emr-7.1.0",
+        "Applications": [
+          {
+            "Name": "Hive"
+          },
+          {
+            "Name": "Spark"
+          },
+          {
+            "Name": "Hadoop"
+          }
+        ],
+        "BootstrapActions": [
+            {
+              "Name": "BootstrapAction",
+              "ScriptBootstrapAction": {
+                "Path": "s3://s3conf-zone/bootstrap/bootstrap.sh"
+              }
+            }
+          ],
+        "LogUri": "s3://aws-logs-360266547329-ap-south-1/elasticmapreduce",
+        "VisibleToAllUsers": true,
+        "Instances": {
+            "Ec2KeyName": "aryan_demo",
+            "KeepJobFlowAliveWhenNoSteps": true,
+            "InstanceGroups": [
+            {
+              "Name": "MasterInstanceGroup",
+              "Market": "ON_DEMAND",
+              "InstanceRole": "MASTER",
+              "InstanceType": "m5.xlarge",
+              "InstanceCount": 1
+            },
+            {
+              "Name": "CoreInstanceGroup",
+              "Market": "ON_DEMAND",
+              "InstanceRole": "CORE",
+              "InstanceType": "m5.xlarge",
+              "InstanceCount": 1
+            }
+          ],
+          "EmrManagedSlaveSecurityGroup": "sg-0524cfff2f31dfa03",
+          "EmrManagedMasterSecurityGroup": "sg-0926143b68fc57116"
+        }
+      },
+      "ResultPath": "$.cluster",
+      "Next": "EMR AddStep"
+    },
+    "EMR AddStep": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::elasticmapreduce:addStep",
+      "Parameters": {
+        "ClusterId": "$.ClusterId",
+        "Step": {
+          "Name": "POS_Step",
+          "HadoopJarStep": {
+            "Jar": "command-runner.jar",
+            "Args": [
+              "spark-submit",
+              "--deploy-mode",
+              "client",
+              "s3://s3conf-zone/script/emr_script1.py"
+            ]
+          }
+        }
+      },
+      "Next": "Wait"
+    },
+    "Wait": {
+      "Type": "Wait",
+      "Seconds": 600,
+      "Next": "EMR TerminateCluster"
+    },
+    "EMR TerminateCluster": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::elasticmapreduce:terminateCluster",
+      "Parameters": {
+        "ClusterId": "MyEMRClusterId"
+      },
+      "End": true
+    }
+  }
+}
