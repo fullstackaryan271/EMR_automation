@@ -1,0 +1,446 @@
+"""
+Job: dim_bank_branch
+"""
+
+__author__          = "Aryan"
+__copyright__       = "Copyright 2024, RPSG"
+__credits__         = ["Aryan"]
+__license__         = "Proprietary"
+__version__         = "1.0"
+__maintainer__      = "Aryan"
+__email__           = "aryan.bhardwaj@ganitinc.com"
+__status__          = "Production"
+
+#################################################################
+import boto3
+from pyspark.sql import SparkSession
+# import io
+import logging
+from configurations.constant_variables import DEV_S3_BUCKET
+from configurations.constant_variables import SILVER_S3_BUCKET
+from pyspark.sql.functions import *
+from dateutil.relativedelta import relativedelta
+from pyspark.sql.types import *
+from pyspark.sql.window import *
+from datetime import datetime, date
+from configurations.constant_variables import CUSTOMER_GOLD_TABLE_TEST
+from engine.abstract_riemannian_job import AbstractRiemannianJob
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+IS_ADHOC_RUN = True  # You can set this value from Glue parameters
+ADHOC_CURRENT_MONTH = 11
+ADHOC_CURRENT_YEAR = 2024
+
+def get_last_1_month(current_year, current_month):
+    last_month_date = (date(current_year, current_month, 1) - relativedelta(months=1))
+    last_month = last_month_date.month
+    last_mon_year = last_month_date.year
+    return last_month, last_mon_year
+
+
+class CustomerDataMonthlyTest(AbstractRiemannianJob):
+
+    def __init__(self):
+        super().__init__()
+        self.spark = SparkSession.builder.appName("YourAppName").getOrCreate()
+        self.Gold_s3_bucket = DEV_S3_BUCKET
+        self.silver_s3_bucket = SILVER_S3_BUCKET
+        self.s3_client = boto3.client('s3')
+        self.POS_input_folder_path = 'Transaction_tables/S_DAILY_SALES_DATA/'
+        self.customer_input_path = 'g_customer_attributes/'
+        self.ULM_folder_path = 'Master_tables/S_DIM_LOCATION_MASTER/'
+        self.lookup_folder_path = 'store_lookup_table/'
+        self.OUTPUT_FOLDER_PATH = 'g_customer_attributes/'
+
+
+        if IS_ADHOC_RUN:
+            self.current_year = ADHOC_CURRENT_YEAR
+            self.current_month = ADHOC_CURRENT_MONTH
+        else:
+            self.current_year = datetime.today().year
+            self.current_month = datetime.today().month
+
+    def fill_job_name(self):
+        """
+        Returns name of the job to be run -> Dim_Bank_Branch_Job
+
+        Returns: str
+        """
+        return CUSTOMER_GOLD_TABLE_TEST
+
+    def transformation(self, pos_input_path, ulm_input_path, output_path, customer_input_path, Lokup_folder_path):
+
+        # read only last month data
+        pos_df = self.spark.read.option("header", "true").option("inferSchema", "true").parquet(*pos_input_path)
+        loc_df = self.spark.read.option("header", "true").option("inferSchema", "true").parquet(ulm_input_path)
+        lookup_df = self.spark.read.option("header", "true").option("inferSchema", "true").parquet(Lokup_folder_path)
+
+        loc_df = loc_df.select("format_2", "store_code")
+
+        # valid_store_code list
+        filtered_store_codes_df = loc_df.filter(
+            (col("company_code").isin(1000, 7000)) &
+            (~col("store_code").isin("D369", "D413")) &
+            (~col("store_code").like("N%")) &  # store_code does not start with 'N'
+            (~col("store_code").like("W%")) &  # store_code does not start with 'W'
+            (~col("store_code").like("R%"))
+        ).select("store_code")
+
+        filtered_store_codes_list = [row["store_code"] for row in filtered_store_codes_df.collect()]
+
+        customer_df = self.spark.read.option("header", "true").option("inferSchema", "true").parquet(*customer_input_path)
+        customer_df_phone = customer_df.select("phone_no", "M5_nob", "M5_visit", "M5_gross_sales",
+                               "M4_nob", "M4_gross_sales", "M4_visit",
+                               "M3_nob", "M3_gross_sales", "M3_visit",
+                               "M2_nob", "M2_gross_sales", "M2_visit",
+                               "M1_nob", "M1_gross_sales", "M1_visit",
+                               "first_month_transacted","gross_sales", "visit", "nob",
+                                "last_month_transacted","is_new"
+                                               )
+        # renaming columns
+        customer_df_phone  = (
+        customer_df_phone
+        .withColumnRenamed("M5_nob", "M6_nob")
+        .withColumnRenamed("M5_visit", "M6_visit")
+        .withColumnRenamed("M5_gross_sales", "M6_gross_sales")
+        .withColumnRenamed("M4_nob", "M5_nob")
+        .withColumnRenamed("M4_visit", "M5_visit")
+        .withColumnRenamed("M4_gross_sales", "M5_gross_sales")
+        .withColumnRenamed("M3_nob", "M4_nob")
+        .withColumnRenamed("M3_visit", "M4_visit")
+        .withColumnRenamed("M3_gross_sales", "M4_gross_sales")
+        .withColumnRenamed("M2_nob", "M3_nob")
+        .withColumnRenamed("M2_visit", "M3_visit")
+        .withColumnRenamed("M2_gross_sales", "M3_gross_sales")
+        .withColumnRenamed("M1_nob", "M2_nob")
+        .withColumnRenamed("M1_visit", "M2_visit")
+        .withColumnRenamed("M1_gross_sales", "M2_gross_sales")
+    )
+
+        # pos_df_filtered = (pos_df.withColumn("partition_month", month(col("BILL_DATE"))))
+        # pos_df_filtered = pos_df_filtered.withColumn("year_month", date_format(col("bill_date"), "yyyy-MM"))
+        # pos_df_filtered = (pos_df_filtered.withColumn("partition_year", year(col("BILL_DATE"))))
+
+        # pos_df_filtered = select only those rows of store_code which are present in valid_store_codes list
+        pos_df_filtered = pos_df.filter(col("store_code").isin(filtered_store_codes_list))
+
+        # select only SALES data
+        pos_df_filtered = pos_df_filtered.filter(col("sale_sign").isin("SALE", "-"))
+
+        # select required columns
+        pos_df_filtered = pos_df_filtered.select("gross_sales_calc", "phone_no", "newcompositekey", "bill_date")
+
+        pos_df_filtered = pos_df_filtered.withColumn(
+            "phone_no",
+            when(length(col("phone_no")) == 10, concat(lit("91"), col("phone_no"))).otherwise(col("phone_no"))
+        )
+
+        df_last_month_agg = pos_df_filtered.groupby("phone_no").agg(
+            countDistinct("newcompositekey").alias("M1_nob"),
+            sum("gross_sales_calc").alias("M1_gross_sales"),
+            countDistinct("bill_date").alias("M1_visit")
+        )
+
+        # for calculating new customers
+        df_uncommon = df_last_month_agg.join(customer_df_phone.select("phone_no").distinct(), on="phone_no", how="left_anti"
+        )
+        df_uncommon = df_uncommon \
+            .withColumn("M2_nob", lit(0)) \
+            .withColumn("M2_gross_sales", lit(0)) \
+            .withColumn("M2_visit", lit(0)) \
+            .withColumn("M3_nob", lit(0)) \
+            .withColumn("M3_gross_sales", lit(0)) \
+            .withColumn("M3_visit", lit(0)) \
+            .withColumn("M4_nob", lit(0)) \
+            .withColumn("M4_gross_sales", lit(0)) \
+            .withColumn("M4_visit", lit(0)) \
+            .withColumn("M5_nob", lit(0)) \
+            .withColumn("M5_gross_sales", lit(0)) \
+            .withColumn("M5_visit", lit(0)) \
+            .withColumn("M6_nob", lit(0)) \
+            .withColumn("M6_gross_sales", lit(0)) \
+            .withColumn("M6_visit", lit(0)) \
+            .withColumn("gross_sales", lit(0)) \
+            .withColumn("nob", lit(0)) \
+            .withColumn("visit", lit(0))
+        # Set is_new as True for new customers
+        df_uncommon = df_uncommon.withColumn("is_new", lit(True))
+
+
+        # to bring all the m1 calculations for last month
+        # df_uncommon = df_uncommon.join(df_last_month_agg, on="phone_no", how="left")
+
+        df_uncommon = df_uncommon.withColumn("gross_sales", (col("M1_gross_sales") + col("gross_sales"))
+                                                         ).withColumn("nob", (col("nob") + col("M1_nob"))
+                                                         ).withColumn("visit", (col("visit") + col("M1_visit")))
+
+        # ======== lmt,ftd logic - implementation =========
+
+        # Update the df_common DataFrame with the last_month_transacted column
+        last_month, last_mon_year = get_last_1_month(self.current_year, self.current_month)
+
+        # Update the df_common DataFrame with the last_month_transacted column
+        df_uncommon = df_uncommon.withColumn(
+            "last_month_transacted",
+            lit(f"{last_mon_year:04d}-{last_month:02d}")  # Format as yyyy-MM
+        ).withColumn(
+            "first_month_transacted",
+            lit(f"{last_mon_year:04d}-{last_month:02d}")  # Format as yyyy-MM
+        )
+
+
+        df_common = customer_df_phone.join(df_last_month_agg, on = "phone_no", how="left").fillna(
+            {"M1_nob": 0, "M1_gross_sales": 0, "M1_visit": 0})
+
+        # ======== Values calculation - implementation ========
+
+        df_common = df_common.withColumn("gross_sales", (col("M1_gross_sales") + col("gross_sales"))
+                                                         ).withColumn("nob", (col("nob") + col("M1_nob"))
+                                                         ).withColumn("visit", (col("visit") + col("M1_visit")))
+
+        # ======== is_new logic - implementation =========
+
+        # last_month, last_mon_year = get_last_1_month(self.current_year, self.current_month)
+
+        # Update the df_common DataFrame with the last_month_transacted column
+        df_common = df_common.withColumn(
+            "last_month_transacted",
+            when(
+                (col("M1_visit") != 0), lit(f"{last_mon_year:04d}-{last_month:02d}")
+            ).when(
+                (col("M1_visit") == 0), col("last_month_transacted")
+        )
+        )
+
+
+        # Set is_new as True for new customers
+        df_common = df_common.withColumn("is_new", lit(False))
+
+        # Append df_uncommon to df_common by column name
+        df_combined = df_common.unionByName(df_uncommon)
+
+
+        # ======== is_tagged logic - implementation ========
+        df_combined = df_combined.withColumn(
+            "is_tagged",
+            when(
+                (length(col("phone_no")) == 12) &  # Phone number has 12 characters (91 + 10 digits)
+                (col("phone_no").startswith("91")) &  # Starts with "91"
+                (col("phone_no").substr(3, 1).isin("6", "7", "8", "9")) &  # First digit after "91" is 6, 7, 8, or 9
+                (expr("size(array_distinct(split(substring(phone_no, 3, 10), '')))") >= 2),
+                # At least 2 distinct digits in the phone_no
+                True
+            ).otherwise(False)
+        )
+
+
+        # ======== calculating lifetime store mapping ========
+        # ======== calculate favourite_store_type2 ========
+        df_gross_sales_sum = lookup_df.groupBy("phone_no", "store_code").agg(
+            sum("gross_sales_calc").alias("sum_gross_sales")
+        )
+        # Step 2: Use a window function to rank store_codes by total_gross_sales and then alphabetically by store_code
+        window_spec1 = Window.partitionBy("phone_no").orderBy(desc("sum_gross_sales"), asc("store_code"))
+
+        # Step 3: Assign ranks to each store_code based on total_gross_sales (and alphabetical order in case of ties)
+        df_with_rank_1 = df_gross_sales_sum.withColumn("row_num", row_number().over(window_spec1))
+        # Step 4: Filter to get only the store_code with rank 1 (highest gross_sales) for each phone_no
+        df_store_type_1 = df_with_rank_1.filter(col("row_num") == 1).select("phone_no", "store_code")
+        df_store_type_1 = df_store_type_1.withColumnRenamed("store_code", "favourite_store_type2")
+
+        df_agg_1 = df_store_type_1.join(loc_df,
+                                        df_store_type_1["favourite_store_type2"] == loc_df["store_code"],
+                                        how="left")
+
+        df_agg_1 = df_agg_1.withColumn("favourite_store_type2_store_flag",
+                                       when(col("format_2") == "SMALL", 'SMALL') \
+                                       .when(col("format_2") == "LARGE", 'LARGE').otherwise(
+                                           'SMALL'))
+
+        df_agg_1 = df_agg_1.select("favourite_store_type2",
+                                   "favourite_store_type2_store_flag", "phone_no")
+
+        df_combined = df_combined.join(df_agg_1, on="phone_no", how="left")
+
+        # ======== calculate favourite_store_type1 ========
+        df_bill_date_count = lookup_df.groupBy("phone_no", "store_code").agg(
+            countDistinct("bill_date").alias("distinct_bill_date_count")
+        )
+        # Step 2: Use a window function to rank store_codes by total_gross_sales and then alphabetically by store_code
+        window_spec2 = Window.partitionBy("phone_no").orderBy(desc("distinct_bill_date_count"), asc("store_code"))
+
+        # Step 3: Assign ranks to each store_code based on total_gross_sales (and alphabetical order in case of ties)
+        df_with_fav_store_type2 = df_bill_date_count.withColumn("row_num", row_number().over(window_spec2))
+
+        # Step 4: Filter to get only the store_code with rank 1 (highest gross_sales) for each phone_no
+        df_with_fav_store_type2 = df_with_fav_store_type2.filter(col("row_num") == 1).select("phone_no", "store_code")
+
+        df_with_fav_store_type2 = df_with_fav_store_type2.withColumnRenamed("store_code", "favourite_store_type1")
+
+        # join loc_df with df_agg
+        df_agg_2 = df_with_fav_store_type2.join(loc_df,
+                                                df_with_fav_store_type2["favourite_store_type1"] == loc_df[
+                                                    "store_code"], how="left")
+
+        df_agg_2 = df_agg_2.withColumn("favourite_store_type1_store_flag",
+                                       when(col("format_2") == "SMALL", 'SMALL') \
+                                       .when(col("format_2") == "LARGE", 'LARGE').otherwise(
+                                           'SMALL'))
+
+        df_agg_2 = df_agg_2.select("favourite_store_type1", "favourite_store_type1_store_flag",
+                                   "phone_no")
+
+        df_combined = df_combined.join(df_agg_2, on="phone_no", how="left")
+
+        # ======== active_customer_segment - implementation ========
+        df_combined = df_combined.withColumn(
+            "active_customer_segment",
+            when(
+                (~col("is_new")) & ((col("M1_visit") + col("M2_visit") + col("M3_visit") + col("M4_visit") + col(
+                    "M5_visit") + col("M6_visit")) == 0),
+                lit("Deep lapser")
+            ).when(
+                (~col("is_new")) & ((col("M1_visit") + col("M2_visit") + col("M3_visit") + col("M4_visit")) == 0) & (
+                        (col("M5_visit") + col("M6_visit")) >= 1),
+                # Check if not 'is_new' and visits sum is at least 1 for m5 and m6
+                lit("lapser")
+            ).when(
+                (~col("is_new")) & ((col("M1_visit") + col("M2_visit")) == 0) & (
+                        (col("M3_visit") + col("M4_visit")) >= 1),
+                # Check if not 'is_new' and visits sum is at least 1 for m3 and m4
+                lit("inactive")
+            ).when(((col("M1_visit") + col("M2_visit")) >= 1),
+                # Check if not 'is_new' and visits sum is at least 1
+                lit("active")
+            ).otherwise(lit("others"))
+        )
+
+        df_combined = df_combined.withColumn(
+            "distinct_visits",
+            expr("IF(M1_visit > 0, 1, 0) + IF(M2_visit > 0, 1, 0) + IF(M3_visit > 0, 1, 0) + IF(M4_visit > 0, 1, 0)")
+        )
+
+
+
+
+        # ======== customer_segment - implementation ========
+        df_combined = df_combined.withColumn(
+            "customer_segment",
+            when(
+                (~col("is_new")) &
+                (col("favourite_store_type1_store_flag") == 'SMALL') &
+                (col("active_customer_segment") == 'active') &
+                (col("M1_visit") >= 1) &
+                ((col("M1_gross_sales") / col("M1_nob")) >= 750) &
+                (col("distinct_visits") >= 3) &
+                ((col("M1_visit") + col("M2_visit") + col("M3_visit") + col("M4_visit")) >= 5),
+                lit("star")
+            ).when(
+                (~col("is_new")) &
+                (col("favourite_store_type1_store_flag") == 'SMALL') &
+                (col("active_customer_segment") == 'active') &
+                (col("M1_visit") >= 1) &
+                ((col("M1_gross_sales") / col("M1_nob")) < 750) &
+                (col("distinct_visits") >= 3) &
+                ((col("M1_visit") + col("M2_visit") + col("M3_visit") + col("M4_visit")) >= 5),
+                lit("loyal")
+            ).when(
+                (~col("is_new")) &
+                (col("favourite_store_type1_store_flag") == 'SMALL') &
+                (col("active_customer_segment") == 'active') &
+                (col("M1_visit") >= 1) &
+                ((col("M2_visit") + col("M3_visit") + col("M4_visit") + col("M5_visit")) == 0),
+                lit("win back")
+            ).when(
+                (~col("is_new")) &
+                (col("favourite_store_type1_store_flag") == 'LARGE') &
+                (col("active_customer_segment") == 'active') &
+                (col("M1_visit") >= 1) &
+                ((col("M1_gross_sales") / col("M1_nob")) >= 1400) &
+                (col("distinct_visits") >= 3) &
+                ((col("M1_visit") + col("M2_visit") + col("M3_visit") + col("M4_visit")) >= 4),
+                lit("star")
+            ).when(
+                (~col("is_new")) &
+                (col("favourite_store_type1_store_flag") == 'LARGE') &
+                (col("active_customer_segment") == 'active') &
+                (col("M1_visit") >= 1) &
+                ((col("M1_gross_sales") / col("M1_nob")) < 1400) &
+                (col("distinct_visits") >= 3) &
+                ((col("M1_visit") + col("M2_visit") + col("M3_visit") + col("M4_visit")) >= 4),
+                lit("loyal")
+            ).when(
+                (~col("is_new")) &
+                (col("favourite_store_type1_store_flag") == 'LARGE') &
+                (col("active_customer_segment") == 'active') &
+                (col("M1_visit") >= 1) &
+                ((col("M2_visit") + col("M3_visit") + col("M4_visit") + col("M5_visit")) == 0),
+                lit("win back")
+            ).otherwise(lit("others"))
+        )
+
+
+
+        df_combined = df_combined.withColumn("PARTITION_YEAR", lit(last_mon_year)).withColumn("PARTITION_MONTH", lit(last_month))
+
+        df_combined = df_combined.select("active_customer_segment", "PARTITION_YEAR", "PARTITION_MONTH",
+                               "phone_no", "is_new", "last_month_transacted", "gross_sales", "visit", "nob",
+                               "favourite_store_type1_store_flag",
+                               "favourite_store_type1", "favourite_store_type2_store_flag", "favourite_store_type2",
+                               "customer_segment", "is_tagged"
+                               , "M5_nob", "M5_visit", "M5_gross_sales",
+                               "M4_nob", "M4_gross_sales", "M4_visit",
+                               "M3_nob", "M3_gross_sales", "M3_visit",
+                               "M2_nob", "M2_gross_sales", "M2_visit",
+                               "M1_nob", "M1_gross_sales", "M1_visit",
+                               "M6_nob", "M6_gross_sales", "M6_visit", "first_month_transacted"
+                               )
+
+
+        df_combined.write.mode("append").option("header", "true").partitionBy("PARTITION_YEAR","PARTITION_MONTH").parquet(output_path,
+                                                                                        compression='snappy')
+
+
+    def do_logic(self):
+        if IS_ADHOC_RUN:
+            current_month = ADHOC_CURRENT_MONTH
+            current_year = ADHOC_CURRENT_YEAR
+        else:
+            current_month = datetime.today().month  # Current month using datetime
+            current_year = datetime.today().year  # Current year using datetime
+
+        pos_input_path, customer_input_path = self.make_paths(current_year, current_month)
+
+        ulm_input_path = f"s3://{self.silver_s3_bucket}/{self.ULM_folder_path}/*"
+        Lokup_folder_path = f"s3://{self.Gold_s3_bucket}/{self.lookup_folder_path}/*"
+        output_path = f"s3://{self.Gold_s3_bucket}/{self.OUTPUT_FOLDER_PATH}"
+        self.transformation(pos_input_path, ulm_input_path, output_path, customer_input_path, Lokup_folder_path)
+        logger.info("All files processed")
+
+    def make_paths(self, current_year, current_month):
+        # Function to get last 6 months in 'year-month' format
+        def get_last_month_pos(year, month):
+            return [((date(year, month, 1) + relativedelta(months=-(i+1))).year,
+                    (date(year, month, 1) + relativedelta(months=-(i+1))).month)
+                    for i in range(1)]
+
+        def get_last_1_months(year, month):
+            return [((date(year, month, 1) + relativedelta(months=-(i+1))).year,
+                    (date(year, month, 1) + relativedelta(months=-(i+1))).month)
+                    for i in range(1,2)]
+
+        last_month_pos = get_last_month_pos(current_year, current_month)
+        last_1_month =  get_last_1_months(current_year, current_month)
+        # Generate paths based on last 6 months
+        pos_input_path = [
+            f"s3://{self.silver_s3_bucket}/{self.POS_input_folder_path}/PARTITION_YEAR={year}/PARTITION_MONTH={month}/*"
+            for year, month in last_month_pos]
+
+        customer_input_path = [
+            f"s3://{self.Gold_s3_bucket}/{self.customer_input_path}/PARTITION_YEAR={year}/PARTITION_MONTH={month}/*"
+            for year, month in last_1_month]
+
+        return pos_input_path, customer_input_path
